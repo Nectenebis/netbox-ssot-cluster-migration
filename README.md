@@ -358,3 +358,13 @@ NetBox validation, vCenter RBAC, TLS внутреннего CA и запуска
 
 Зависимости зафиксированы с хешами в requirements*.txt; обновляйте их отдельно
 после тестов. Источники проверки API и детали совместимости: [docs/api-research.md](docs/api-research.md).
+
+Фиксация зависимостей должна учитывать минимальный Python 3.11, а не только
+версию Python на компьютере разработчика. Используется pynetbox 7.8.0:
+версия 7.9.0 требует Python 3.12+. Для пересоздания файлов зависимостей:
+
+```bash
+uv pip compile pyproject.toml --python-version 3.11 --generate-hashes -o requirements.txt
+uv pip compile pyproject.toml --python-version 3.11 --extra dev --constraint requirements.txt \
+  --generate-hashes -o requirements-dev.txt
+```

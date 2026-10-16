@@ -17,7 +17,8 @@
   без учёта регистра в cluster + tenant; SSoT игнорирует tenant при поиске, поэтому
   reconciler консервативнее и блокирует конфликт name + cluster для любого tenant.
   Scoped Cluster дополнительная проверка намеренно ограничена `dcim.site`.
-* [pynetbox](https://github.com/netbox-community/pynetbox), установленная версия 7.9.0:
+* [pynetbox](https://github.com/netbox-community/pynetbox): интерфейсы проверены
+  на 7.9.0; зависимости зафиксированы на 7.8.0 для Python 3.11 (7.9.0 требует 3.12+).
   проверены `api`, `Endpoint.all/filter/get`, `Record.__iter__`,
   `core.query.Request.patch`. Используется persistent requests Session,
   pagination offset (pynetbox), явный timeout и PATCH строго с переданным dict.
