@@ -33,6 +33,8 @@ class VM:
     name: str
     cluster_ref: str
     host_ref: str
+    cluster_name: str = ""
+    host_name: str = ""
 
     @property
     def key(self) -> tuple[str, str]:

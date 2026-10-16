@@ -1,3 +1,4 @@
+from dataclasses import replace
 from types import SimpleNamespace as NS
 from unittest.mock import MagicMock
 
@@ -27,13 +28,16 @@ def test_vmware_inventory_and_fresh_identity(env, monkeypatch):
     def properties(content, kind, paths, objects=None):
         if kind == vim.HostSystem:
             return [row(host, {"name": "mesx002", "parent": cluster})]
+        if kind == vim.ClusterComputeResource:
+            return [row(cluster, {"name": "DevTest"})]
         return [row(obj, props)]
 
     monkeypatch.setattr("netbox_vm_reconcile.vmware.properties", properties)
     reader = VMware(env.cfg.vcenters)
     reader.sessions["mvcenter"] = (env.cfg.vcenters[0], content)
-    assert reader.inventory() == [env.vm]
-    assert reader.refresh(env.vm) == env.vm
+    expected = replace(env.vm, cluster_name="DevTest", host_name="mesx002")
+    assert reader.inventory() == [expected]
+    assert reader.refresh(expected) == expected
     props["name"] = "new"
     assert reader.refresh(env.vm).name == "new"
     props["config.instanceUuid"] = None

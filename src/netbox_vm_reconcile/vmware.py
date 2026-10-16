@@ -1,5 +1,6 @@
 """Read-only vSphere PropertyCollector inventory with bounded, paginated requests."""
 
+import logging
 import ssl
 from contextlib import ExitStack
 
@@ -11,6 +12,7 @@ from .identity import VM, SafetyError, uuid, validate_inventory
 
 PC = vmodl.query.PropertyCollector
 VM_PATHS = ["name", "config.instanceUuid", "config.uuid", "config.template", "runtime.host"]
+LOG = logging.getLogger(__name__)
 
 
 def properties(content, kind, paths, objects=None) -> list:
@@ -65,11 +67,24 @@ class VMware:
         self.stack = ExitStack()
         self.sessions: dict = {}
         self.objects: dict = {}
+        self.vcenter_uuids: dict[str, str] = {}
+        self.cluster_names: dict[str, dict[str, str]] = {}
+
+    def identities(self) -> dict[str, str]:
+        return dict(self.vcenter_uuids)
 
     def __enter__(self):
         try:
             for config in self.configs:
-                context = ssl.create_default_context(cafile=config.ca_file)
+                context = ssl.create_default_context(
+                    cafile=config.ca_file if config.verify_ssl else None
+                )
+                if not config.verify_ssl:
+                    context.check_hostname = False
+                    context.verify_mode = ssl.CERT_NONE
+                    LOG.warning(
+                        "vCenter source=%s TLS certificate verification disabled", config.name
+                    )
                 si = SmartConnect(
                     host=config.hostname,
                     port=config.port,
@@ -81,10 +96,15 @@ class VMware:
                 self.stack.callback(Disconnect, si)
                 content = si.RetrieveContent()
                 observed = uuid(content.about.instanceUuid)
-                if content.about.apiType != "VirtualCenter" or observed != config.expected_uuid:
+                if content.about.apiType != "VirtualCenter" or (
+                    config.expected_uuid is not None and observed != config.expected_uuid
+                ):
                     raise SafetyError(
                         f"vCenter identity mismatch source={config.name} observed UUID={observed}"
                     )
+                if observed in self.vcenter_uuids.values():
+                    raise SafetyError("Several configured sources connect to the same vCenter UUID")
+                self.vcenter_uuids[config.name] = observed
                 self.sessions[config.name] = (config, content)
             return self
         except SafetyError:
@@ -111,19 +131,25 @@ class VMware:
             raise SafetyError("Standalone ESXi inventory requires a separate source; excluded here")
         return VM(
             config.name,
-            config.expected_uuid,
+            uuid(self.vcenter_uuids.get(config.name) or config.expected_uuid),
             uuid(p.get("config.instanceUuid")),
             uuid(p.get("config.uuid")),
             row.obj._moId,
             p["name"],
             parent._moId,
             host._moId,
+            self.cluster_names.get(config.name, {}).get(parent._moId, ""),
+            hosts[host._moId].get("name", ""),
         )
 
     def inventory(self) -> list[VM]:
         try:
             result = []
             for name, (config, content) in self.sessions.items():
+                self.cluster_names[name] = {
+                    r.obj._moId: values(r)["name"]
+                    for r in properties(content, vim.ClusterComputeResource, ["name"])
+                }
                 hosts = {
                     r.obj._moId: values(r)
                     for r in properties(content, vim.HostSystem, ["name", "parent"])
@@ -156,6 +182,14 @@ class VMware:
                 r.obj._moId: values(r)
                 for r in properties(content, vim.HostSystem, ["name", "parent"], [host])
             }
+            parent = hosts.get(host._moId, {}).get("parent")
+            if isinstance(parent, vim.ClusterComputeResource):
+                cluster_rows = properties(content, vim.ClusterComputeResource, ["name"], [parent])
+                if len(cluster_rows) != 1:
+                    raise SafetyError("VM cluster disappeared during processing")
+                self.cluster_names.setdefault(vm.source, {})[parent._moId] = values(
+                    cluster_rows[0]
+                )["name"]
             current = self._vm(config, rows[0], hosts)
             if current is None:
                 raise SafetyError("VM became an excluded template")

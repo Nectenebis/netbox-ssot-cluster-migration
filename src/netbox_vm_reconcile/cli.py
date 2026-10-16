@@ -37,7 +37,7 @@ def parser() -> argparse.ArgumentParser:
         commands.add_parser(name, parents=[common_options()])
     mappings = commands.add_parser("mappings", parents=[common_options()])
     subs = mappings.add_subparsers(dest="action", required=True)
-    for name in ("init", "list", "export", "backup", "bind"):
+    for name in ("init", "migrate", "list", "export", "backup", "bind"):
         sub = subs.add_parser(name, parents=[common_options()])
         if name == "backup":
             sub.add_argument("destination", type=Path)
@@ -63,10 +63,13 @@ def main(argv=None) -> int:
             config = load(args.config)
         db = config.database
         with lock(db.with_suffix(db.suffix + ".lock")):
-            if args.command == "mappings" and args.action == "init":
+            if args.command == "mappings" and args.action in {"init", "migrate"}:
                 if not args.apply:
-                    raise SafetyError("Explicit state initialization requires --apply")
-                Store.initialize(db)
+                    raise SafetyError("State initialization/migration requires --apply")
+                if args.action == "init":
+                    Store.initialize(db)
+                else:
+                    Store.migrate(db)
                 return 0
             if args.command == "inventory":
                 with VMware(config.vcenters) as vmware:

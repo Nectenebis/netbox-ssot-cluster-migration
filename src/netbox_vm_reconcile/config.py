@@ -1,4 +1,4 @@
-"""Strict YAML configuration with explicit, fail-closed placement mappings."""
+"""Strict YAML configuration with automatic discovery and optional identity pins."""
 
 import os
 import re
@@ -18,14 +18,15 @@ class VCenter:
     hostname: str
     username: str = field(repr=False)
     password: str = field(repr=False)
-    expected_uuid: str
-    cluster_ids: dict[str, int]
-    host_ids: dict[str, int]
+    expected_uuid: str | None = None
+    cluster_ids: dict[str, int] = field(default_factory=dict)
+    host_ids: dict[str, int] = field(default_factory=dict)
     port: int = 443
     ca_file: str | None = None
     timeout: int = 30
     source_tag: str = ""
     ignore_templates: bool = True
+    verify_ssl: bool = True
 
 
 @dataclass(frozen=True)
@@ -119,22 +120,26 @@ def load(path: str, credentials: bool = True) -> Config:
                     hostname=_text(v["hostname"]),
                     username=_secret(v["username"], credentials),
                     password=_secret(v["password"], credentials),
-                    expected_uuid=uuid(v["expected_uuid"]),
-                    cluster_ids=_ids(v["cluster_ids"]),
-                    host_ids=_ids(v["host_ids"]),
+                    expected_uuid=(
+                        uuid(v["expected_uuid"]) if v.get("expected_uuid") is not None else None
+                    ),
+                    cluster_ids=_ids(v.get("cluster_ids", {})),
+                    host_ids=_ids(v.get("host_ids", {})),
                     port=_positive(v.get("port", 443)),
                     ca_file=v.get("ca_file"),
                     timeout=_positive(v.get("timeout", 30)),
                     source_tag=_text(v.get("source_tag", f"Source: {v['name']}")),
                     ignore_templates=_bool(v.get("ignore_templates", True)),
+                    verify_ssl=_bool(v.get("verify_ssl", True)),
                 )
             )
         if (
             not vcs
             or len({v.name for v in vcs}) != len(vcs)
-            or len({v.expected_uuid for v in vcs}) != len(vcs)
+            or len({v.expected_uuid for v in vcs if v.expected_uuid})
+            != sum(v.expected_uuid is not None for v in vcs)
         ):
-            raise SafetyError("vCenter source names and expected UUIDs must be unique and nonempty")
+            raise SafetyError("vCenter source names and configured UUID pins must be unique")
         db = Path(_text(state["database"]))
         if not db.is_absolute():
             raise SafetyError("State database path must be absolute")

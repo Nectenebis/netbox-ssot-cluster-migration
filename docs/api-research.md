@@ -33,6 +33,12 @@
   [AboutInfo](https://developer.broadcom.com/xapis/vsphere-web-services-api/latest/vim.AboutInfo.html).
   Не гарантируется сохранение VM UUID при любом способе cross-vCenter migration.
 
-Ограничения: явные ID placement должны поддерживаться оператором; неоднозначность
-не разрешается по DNS, одному имени или BIOS UUID. Гонки между отдельными HTTPS
-запросами исключаются общей операционной сериализацией writers, не REST API.
+Placement автоматически находится по source + source_id (MoRef), при отсутствии
+source_id — по уникальному имени внутри source с проверкой tags. Чужой source_id
+не переопределяется совпадением имени. Явные ID оставлены как необязательные исключения.
+vCenter UUID автоматически закрепляется в SQLite при bootstrap apply; дополнительный
+expected_uuid в YAML необязателен. verify_ssl по умолчанию true, явное false создаёт
+SSLContext с CERT_NONE/check_hostname=False только для соответствующего vCenter.
+Неоднозначность не разрешается по DNS, одному имени или BIOS UUID. Гонки между
+отдельными HTTPS запросами исключаются общей операционной сериализацией writers,
+не REST API.

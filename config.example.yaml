@@ -12,20 +12,19 @@ vmware:
     hostname: mvcenter.example.local
     username: ${VCENTER_USER}
     password: ${VCENTER_PASSWORD}
-    expected_uuid: 11111111-1111-4111-8111-111111111111
-    source_tag: 'Source: mvcenter'  # Match custom SSoT tag if configured.
+    # UUID is discovered and saved by bootstrap --apply; no manual UUID needed.
+    # expected_uuid: 11111111-1111-4111-8111-111111111111  # Optional extra pin.
+    # source_tag: 'Source: mvcenter'  # Optional; defaults to Source: <name>.
+    verify_ssl: true  # Set false to disable vCenter certificate/hostname verification.
     port: 443
     timeout: 30
     ignore_templates: true
     # ca_file: /etc/ssl/certs/company-ca-bundle.pem
-    # Explicit vSphere MoRef -> existing NetBox ID, NOT VM identity keys.
-    cluster_ids:
-      domain-c101: 10  # DevTest
-      domain-c102: 20  # prod62
-    host_ids:
-      host-201: 101  # mesx002 in DevTest
-      host-202: 102  # mesx001 in prod62
-  # Additional vCenters use their own UUID, source, credentials and mappings.
+    # Cluster/ESXi discovery uses source + source_id, then unique name + source.
+    # Manual overrides are optional, only for objects that cannot be discovered:
+    # cluster_ids: {domain-c101: 10, domain-c102: 20}
+    # host_ids: {host-201: 101, host-202: 102}
+  # Additional vCenters use their own source names and credentials.
 reconcile:
   allow_rename: true
   allow_cluster_change: true

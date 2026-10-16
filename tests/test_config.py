@@ -27,7 +27,10 @@ def test_valid_config(config_file):
     _, save = config_file
     cfg = load(save())
     assert cfg.timeout == 30
-    assert cfg.vcenters[0].cluster_ids["domain-c102"] == 20
+    assert cfg.vcenters[0].cluster_ids == {}
+    assert cfg.vcenters[0].host_ids == {}
+    assert cfg.vcenters[0].expected_uuid is None
+    assert cfg.vcenters[0].verify_ssl is True
     assert "not-a-real-credential" not in repr(cfg)
 
 
@@ -47,7 +50,7 @@ def test_invalid_config(config_file, mutation):
     elif mutation == "url":
         data["netbox"]["url"] = "http://netbox.example.local"
     else:
-        data["vmware"][0]["host_ids"]["host-201"] = True
+        data["vmware"][0]["host_ids"] = {"host-201": True}
     with pytest.raises(SafetyError):
         load(save())
 
@@ -70,3 +73,18 @@ def test_local_state_config_does_not_resolve_secrets(config_file, monkeypatch):
     assert cfg.token == "" and cfg.vcenters[0].password == ""
     assert cli.main(["mappings", "init", "--config", path, "--apply"]) == 0
     assert cli.main(["mappings", "list", "--config", path]) == 0
+
+
+def test_vcenter_tls_can_be_disabled_without_changing_netbox(config_file):
+    data, save = config_file
+    data["vmware"][0]["verify_ssl"] = False
+    cfg = load(save())
+    assert cfg.vcenters[0].verify_ssl is False
+    assert cfg.ca_file is None
+
+
+def test_vcenter_tls_flag_must_be_a_boolean(config_file):
+    data, save = config_file
+    data["vmware"][0]["verify_ssl"] = "false"
+    with pytest.raises(SafetyError, match="boolean"):
+        load(save())

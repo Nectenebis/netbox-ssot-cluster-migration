@@ -1,4 +1,6 @@
 import json
+import ssl
+from dataclasses import replace
 from types import SimpleNamespace as NS
 from unittest.mock import MagicMock
 
@@ -127,3 +129,18 @@ def test_vmware_connection_failure_is_sanitized(env, monkeypatch):
         with VMware(env.cfg.vcenters):
             pass
     assert "secret-password" not in str(error.value)
+
+
+@pytest.mark.parametrize("verify", [True, False])
+def test_vcenter_uuid_autodiscovery_and_explicit_tls_option(env, monkeypatch, verify):
+    si = MagicMock()
+    si.RetrieveContent.return_value.about = NS(instanceUuid=VC, apiType="VirtualCenter")
+    connect = MagicMock(return_value=si)
+    monkeypatch.setattr("netbox_vm_reconcile.vmware.SmartConnect", connect)
+    monkeypatch.setattr("netbox_vm_reconcile.vmware.Disconnect", MagicMock())
+    config = replace(env.cfg.vcenters[0], expected_uuid=None, verify_ssl=verify)
+    with VMware([config]) as reader:
+        assert reader.identities() == {"mvcenter": VC}
+    context = connect.call_args.kwargs["sslContext"]
+    assert context.check_hostname is verify
+    assert context.verify_mode == (ssl.CERT_REQUIRED if verify else ssl.CERT_NONE)

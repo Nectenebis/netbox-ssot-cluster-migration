@@ -4,11 +4,11 @@ import logging
 from collections import Counter, defaultdict
 
 from .config import Config
-from .identity import VM, SafetyError, object_id, validate_inventory
+from .identity import VM, SafetyError, object_id, uuid, validate_inventory
 from .mappings import Store
+from .placement import Placement, owned
 
 LOG = logging.getLogger(__name__)
-FOREIGN_TYPES = {"ovirt", "opennebula", "proxmox", "openstack", "hetznercloud"}
 
 
 class Engine:
@@ -17,7 +17,22 @@ class Engine:
         self.sources = {vc.name: vc for vc in config.vcenters}
         self.vms = vmware.inventory()  # All vCenters must succeed before any write.
         validate_inventory(self.vms)
+        self.observed = {name: uuid(value) for name, value in vmware.identities().items()}
+        if set(self.observed) != set(self.sources) or len(set(self.observed.values())) != len(
+            self.observed
+        ):
+            raise SafetyError("Incomplete or duplicate vCenter identities")
+        self.registered = store.vcenters()
+        for source, saved_uuid in self.registered.items():
+            if self.observed.get(source) != saved_uuid:
+                raise SafetyError(f"Registered vCenter UUID/source changed: source={source}")
+        for source, vc in self.sources.items():
+            if vc.expected_uuid and vc.expected_uuid != self.observed[source]:
+                raise SafetyError(f"Configured vCenter UUID mismatch: source={source}")
+        if any(self.observed.get(vm.source) != vm.vcenter_uuid for vm in self.vms):
+            raise SafetyError("VM inventory does not match connected vCenter identities")
         self.records, self.clusters, self.devices = netbox.snapshot()
+        self.placement = Placement(self.clusters, self.devices)
         self.by_id = {r["id"]: r for r in self.records}
         self.by_name: dict[str, list[dict]] = defaultdict(list)
         for r in self.records:
@@ -25,25 +40,31 @@ class Engine:
         self.vm_names = Counter(v.name.casefold() for v in self.vms)
         self.mappings = {(m["vcenter_uuid"], m["vm_instance_uuid"]): m for m in store.rows()}
         self.vm_by_key = {v.key: v for v in self.vms}
-        configured = {v.expected_uuid: v.name for v in config.vcenters}
         for key, row in self.mappings.items():
-            if configured.get(key[0]) != row["source_name"]:
+            if self.registered.get(row["source_name"]) != key[0]:
                 raise SafetyError("Mapped vCenter UUID/source missing from configuration")
 
     def owned(self, record: dict, vm: VM) -> bool:
-        tags = {tag["name"] for tag in record.get("tags", [])}
-        return (
-            record.get("custom_fields", {}).get("source") == vm.source
-            and "vmware" in tags
-            and self.sources[vm.source].source_tag in tags
-            and not tags.intersection(FOREIGN_TYPES)
-        )
+        return owned(record, self.sources[vm.source])
+
+    def register_sources(self, apply: bool, names=None) -> None:
+        selected = self.observed if names is None else {n: self.observed[n] for n in names}
+        for name, observed in selected.items():
+            if name not in self.registered:
+                LOG.info(
+                    "%s register vCenter source=%s UUID=%s",
+                    "APPLY" if apply else "DRY-RUN",
+                    name,
+                    observed,
+                )
+        if apply:
+            self.store.register_vcenters(selected)
+            self.registered.update(selected)
 
     def targets(self, vm: VM) -> tuple[int, int, int]:
         vc = self.sources[vm.source]
-        cid, did = vc.cluster_ids.get(vm.cluster_ref), vc.host_ids.get(vm.host_ref)
-        if not cid or not did or cid not in self.clusters or did not in self.devices:
-            raise SafetyError(f"Missing configured Cluster/ESXi Device for {vm.name}")
+        cid = self.placement.resolve("Cluster", vc, vm.cluster_ref, vm.cluster_name)
+        did = self.placement.resolve("Device", vc, vm.host_ref, vm.host_name)
         self.validate_placement(self.clusters[cid], self.devices[did], cid, did)
         return cid, did, object_id(self.devices[did]["site"])  # type: ignore[return-value]
 
@@ -117,6 +138,7 @@ class Engine:
         return record, cid
 
     def bootstrap(self, apply: bool = False) -> int:
+        self.register_sources(apply)
         errors = 0
         bound = {r["netbox_vm_id"] for r in self.mappings.values()}
         for vm in self.vms:
@@ -179,9 +201,12 @@ class Engine:
             if record["name"].casefold() != vm.name.casefold():
                 candidates += self.netbox.named(record["name"])
             self.duplicates(vm, record, cid, candidates)
+            self.register_sources(True, [source])
             self.store.bind(vm, pk, cid)
 
     def reconcile(self, apply: bool = False, check: bool = False) -> int:
+        if set(self.observed) - set(self.registered):
+            raise SafetyError("Unregistered vCenter UUID; run bootstrap --dry-run then --apply")
         errors = 0
         for key, absent_row in self.mappings.items():
             if key not in self.vm_by_key:
@@ -226,6 +251,8 @@ class Engine:
                         if current != record:
                             raise SafetyError("NetBox VM changed concurrently; rerun required")
                         cluster, device = self.netbox.placement(cid, did)
+                        if cluster != self.clusters[cid] or device != self.devices[did]:
+                            raise SafetyError("Target Cluster/Device changed concurrently")
                         self.validate_placement(cluster, device, cid, did)
                         if object_id(device["site"]) != sid:
                             raise SafetyError("Device Site changed concurrently")

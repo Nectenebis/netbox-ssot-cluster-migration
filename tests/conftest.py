@@ -35,6 +35,10 @@ class FakeVMware:
     def __init__(self, vms):
         self.vms = vms
         self.refresh_override = None
+        self.vcenter_uuids = {v.source: v.vcenter_uuid for v in vms}
+
+    def identities(self):
+        return {**self.vcenter_uuids, **{v.source: v.vcenter_uuid for v in self.vms}}
 
     def inventory(self):
         return self.vms
@@ -90,6 +94,7 @@ def env(tmp_path):
     Store.initialize(db)
     store = Store(db, True)
     vm = VM("mvcenter", VC, INSTANCE, BIOS, "vm-1", "mnetbox", "domain-c101", "host-201")
+    store.register_vcenters({"mvcenter": VC})
     vc = VCenter(
         "mvcenter",
         "vc.example.test",

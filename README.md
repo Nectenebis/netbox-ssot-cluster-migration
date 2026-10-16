@@ -21,8 +21,11 @@
 * Имя `vmware[].name` точно соответствует имени VMware source в SSoT.
   Для VM обязательны `custom_fields.source == name`, tag `vmware` и source tag
   (по умолчанию `Source: <name>`). Смешанные известные source type tags запрещены.
-* В конфигурации задаются явные связи MoRef к существующим ID кластеров и устройств.
-  Это исключает угадывание кластера по имени в нескольких vCenter.
+* Кластеры и ESXi находятся автоматически: сначала по `custom_fields.source` +
+  `custom_fields.source_id` (VMware MoRef), затем по уникальному имени внутри source,
+  если у найденного объекта нет source_id. Проверяются VMware type и source tags.
+  Совпадение имени с другим source_id считается конфликтом. Ручные `cluster_ids`
+  и `host_ids` необязательны и имеют приоритет как явно заданные исключения.
 * Имена VM должны совпадать с результатом SSoT. Если SSoT применяет преобразования
   имён, фильтры inventory или синхронизирует standalone ESXi, сначала согласуйте
   области синхронизации. Здесь standalone inventory останавливает preflight,
@@ -50,16 +53,26 @@ UUID нормализуются. BIOS UUID (`config.uuid`) сохраняетс�
 зависит от операции и версии, поэтому автоматического переноса mapping нет.
 Нельзя выводить тождество VM из одного BIOS UUID или имени.
 
-`expected_uuid` закрепляет идентичность vCenter независимо от DNS. Его изменение
-блокирует соединение. UUID и MoRef можно получить через PowerCLI:
+UUID самого vCenter (`content.about.instanceUuid`) получается автоматически при
+подключении. `bootstrap --dry-run` показывает новые UUID без записи;
+`bootstrap --apply` сохраняет их в SQLite, включая vCenter без VM. После этого
+смена UUID у того же source, повторное использование UUID другим source или
+удаление зарегистрированного source из конфигурации блокируют запуск до ручного
+разбора. Изменение DNS само по себе не меняет идентичность. Обычный reconcile
+никогда не регистрирует новый vCenter автоматически. Первая регистрация доверяет
+серверу, к которому вы настроили подключение; проверьте адрес перед bootstrap.
+
+`expected_uuid` теперь необязателен: при желании это дополнительная ручная проверка
+поверх SQLite. Убирать его из существующего YAML можно — сохранённый UUID остаётся.
+PowerCLI для обычной настройки больше не нужен. Для диагностики UUID и MoRef:
 
 ```powershell
 $si = Get-View ServiceInstance
 $si.Content.About.InstanceUuid
 Get-VM | Select Name, @{N='InstanceUuid';E={$_.ExtensionData.Config.InstanceUuid}},
   @{N='BiosUuid';E={$_.ExtensionData.Config.Uuid}}, Id
-Get-Cluster | Select Name, Id
-Get-VMHost | Select Name, Id
+Get-Cluster | Select Name, @{N='MoRef';E={$_.ExtensionData.MoRef.Value}}
+Get-VMHost | Select Name, @{N='MoRef';E={$_.ExtensionData.MoRef.Value}}
 ```
 
 Для YAML используйте голый MoRef (`domain-c101`, `host-201`), без префикса
@@ -67,6 +80,7 @@ PowerCLI `ClusterComputeResource-` или `HostSystem-`. После настро
 `inventory` выводит текущие UUID и MoRef без обращения к NetBox.
 
 SQLite содержит source, оба UUID VM, NetBox ID, последнее имя/кластер и timestamps.
+Отдельная таблица `vcenters` закрепляет уникальную связь source → vCenter UUID.
 Ограничения PRIMARY KEY и UNIQUE обеспечивают связь один-к-одному. Каждая запись
 фиксируется отдельной транзакцией с `synchronous=FULL`. Автоматического удаления
 или перепривязки нет. Временно отсутствующие VM сохраняются с предупреждением.
@@ -91,10 +105,10 @@ install -d -m 0750 -o root -g netbox-ssot /etc/netbox-vm-reconcile
 install -m 0640 -o root -g netbox-ssot config.example.yaml /etc/netbox-vm-reconcile/config.yaml
 ```
 
-Отредактируйте YAML: реальные URL, source, UUID vCenter, ID Cluster/Device и CA.
+Отредактируйте YAML: реальные URL/hostname, source, переменные секретов и настройки TLS.
 Полный образец: [config.example.yaml](config.example.yaml). Несколько vCenter
 задаются дополнительными элементами `vmware`, каждый со своими переменными.
-Краткий пример (ID и UUID обязательно заменить):
+Краткий пример — ручные UUID, Cluster ID и Host ID не требуются:
 
 ```yaml
 netbox:
@@ -108,9 +122,7 @@ vmware:
     hostname: mvcenter.example.local
     username: ${VCENTER_USER}
     password: ${VCENTER_PASSWORD}
-    expected_uuid: 11111111-1111-4111-8111-111111111111
-    cluster_ids: {domain-c101: 10, domain-c102: 20}
-    host_ids: {host-201: 101, host-202: 102}
+    verify_ssl: true
 reconcile:
   allow_rename: true
   allow_cluster_change: true
@@ -132,9 +144,52 @@ VCENTER_PASSWORD=<secret>
 через ваш менеджер секретов или защищённую сессию. Пример EnvironmentFile рассчитан
 на systemd, не на исполнение через shell `source`.
 
-TLS проверяется всегда; отключения проверки нет. Для внутреннего CA укажите
-`ca_file` в `netbox` и соответствующем элементе `vmware`. vSphere использует
-прямой HTTPS SDK (не HTTP REST); сеть/прокси должны поддерживать этот маршрут.
+TLS проверяется по умолчанию. Для внутреннего CA укажите `ca_file` в `netbox` и
+соответствующем элементе `vmware`. Чтобы отключить проверку сертификата и hostname
+только у конкретного vCenter, укажите в его секции `verify_ssl: false`. HTTPS
+сохраняется, но подлинность сервера по сертификату не проверяется; приложение
+выдаёт предупреждение. Проверка сохранённого UUID продолжает работать, однако
+она не заменяет проверку TLS. `ca_file` при отключённой проверке vCenter игнорируется.
+NetBox TLS остаётся обязательным. vSphere использует прямой HTTPS SDK (не HTTP REST);
+сеть/прокси должны поддерживать этот маршрут.
+
+Если SSoT переименовывает Cluster/Device и нет source_id, либо placement-объекты
+не имеют source metadata/tags, можно явно указать исключения внутри нужного vCenter:
+
+```yaml
+cluster_ids: {domain-c101: 10, domain-c102: 20}
+host_ids: {host-201: 101, host-202: 102}
+```
+
+Слева — VMware MoRef, справа — ID существующего объекта NetBox. Для ESXi внутри
+кластеров автоматически определяется Device, а Site берётся из него. При межкластерной
+миграции Cluster, Device и Site обновляются согласованно; standalone ESXi не поддержаны.
+
+## Обновление с 0.1.x
+
+Схема SQLite обновлена с v1 до v2 для сохранения vCenter UUID. Не создавайте БД заново.
+Остановите timer и дождитесь завершения service. **До обновления кода** сделайте
+backup командой старой версии `mappings backup /secure/backup/state-before-v2.db --apply`.
+Если код уже обновлён, резервную копию v1 можно сделать штатным SQLite backup API.
+Затем обновите код и пакет:
+
+```bash
+cd /opt/netbox-vm-reconcile
+git pull --ff-only origin main
+.venv/bin/python -m pip install --require-hashes -r requirements.txt
+.venv/bin/python -m pip install --no-deps .
+.venv/bin/netbox-vm-reconcile mappings migrate --apply
+.venv/bin/netbox-vm-reconcile bootstrap --dry-run
+.venv/bin/netbox-vm-reconcile bootstrap --apply
+.venv/bin/netbox-vm-reconcile reconcile --dry-run
+```
+
+Как и остальные рабочие команды, migrate/bootstrap выполняются под сервисным
+пользователем; bootstrap требует секреты в окружении. Миграция локальная и не
+подключается к API: она переносит UUID из существующих VM mapping, не меняя ни
+одного NetBox ID. Противоречивые старые source/UUID приводят к откату всей миграции.
+Повторный migrate для v2 ничего не меняет. Ни dry-run, ни обычный reconcile не
+мигрируют БД. Для новой установки используйте `mappings init`, а не migrate.
 
 ## Первичная регистрация
 
@@ -163,6 +218,8 @@ Bootstrap ищет **единственное** совпадение имени 
 Bootstrap пишет только SQLite, никогда не PATCH-ит NetBox. Повторный запуск
 проверяет уже сохранённые связи. Неоднозначности приводят к коду 2; однозначные
 связи при apply могут быть зарегистрированы, остальные требуют ручной проверки.
+UUID успешно прочитанных vCenter сохраняются при bootstrap apply независимо от
+наличия VM-конфликтов. Частично успешный bootstrap всё равно возвращает 2.
 
 Если VM уже мигрировала, оператор после проверки UUID, MAC/IP и истории может
 явно подтвердить старый правильный ID:
@@ -288,7 +345,8 @@ python3 -m venv .venv
 ```
 
 Unit/fake API тесты покрывают миграции, idempotence, bootstrap, конфликт UUID,
-ownership, dry-run, SQLite, lock, ошибки и частичный успех. Отдельно проверяется
+ownership, автоматический placement, регистрацию vCenter, миграцию схемы SQLite,
+явное отключение TLS vCenter, dry-run, lock, ошибки и частичный успех. Отдельно проверяется
 реальный pynetbox transport с mock HTTP, пагинация, ограничение PATCH и pyVmomi
 PropertyCollector/SmartConnect с mocks. Они не заменяют live интеграционные тесты
 NetBox validation, vCenter RBAC, TLS внутреннего CA и запуска systemd.
