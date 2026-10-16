@@ -37,7 +37,7 @@ class Engine:
         self.by_name: dict[str, list[dict]] = defaultdict(list)
         for r in self.records:
             self.by_name[r["name"].casefold()].append(r)
-        self.vm_names = Counter(v.name.casefold() for v in self.vms)
+        self.vm_names = Counter((v.source, v.name.casefold()) for v in self.vms)
         self.mappings = {(m["vcenter_uuid"], m["vm_instance_uuid"]): m for m in store.rows()}
         self.vm_by_key = {v.key: v for v in self.vms}
         for key, row in self.mappings.items():
@@ -46,6 +46,11 @@ class Engine:
 
     def owned(self, record: dict, vm: VM) -> bool:
         return owned(record, self.sources[vm.source])
+
+    def source_candidates(self, vm: VM, candidates: list[dict]) -> list[dict]:
+        # Retain same-source objects with invalid/missing tags so they still cause
+        # ambiguity instead of silently hiding a possible duplicate.
+        return [r for r in candidates if (r.get("custom_fields") or {}).get("source") == vm.source]
 
     def register_sources(self, apply: bool, names=None) -> None:
         selected = self.observed if names is None else {n: self.observed[n] for n in names}
@@ -128,13 +133,17 @@ class Engine:
 
     def bootstrap_candidate(self, vm: VM) -> tuple[dict, int]:
         cid, _, _ = self.targets(vm)
-        candidates = self.by_name[vm.name.casefold()]
-        if self.vm_names[vm.name.casefold()] != 1 or len(candidates) != 1:
+        all_candidates = self.by_name[vm.name.casefold()]
+        candidates = self.source_candidates(vm, all_candidates)
+        if self.vm_names[vm.source, vm.name.casefold()] != 1 or len(candidates) != 1:
             ids = [(r["id"], object_id(r.get("cluster"))) for r in candidates]
-            raise SafetyError(f"Ambiguous/missing bootstrap candidate {vm.name}: {ids}")
+            raise SafetyError(
+                f"Ambiguous/missing bootstrap candidate source={vm.source} VM={vm.name}: {ids}"
+            )
         record = candidates[0]
         if not self.owned(record, vm) or object_id(record.get("cluster")) != cid:
             raise SafetyError(f"Bootstrap ownership/cluster mismatch for {vm.name}; bind manually")
+        self.duplicates(vm, record, cid, all_candidates)
         return record, cid
 
     def bootstrap(self, apply: bool = False) -> int:
@@ -166,9 +175,16 @@ class Engine:
                     current = self.netbox.get_vm(record["id"])
                     if current != record:
                         raise SafetyError("NetBox candidate changed during bootstrap")
-                    candidates = self.netbox.named(vm.name)
-                    if len(candidates) != 1 or candidates[0]["id"] != record["id"]:
+                    all_candidates = self.netbox.named(vm.name)
+                    candidates = self.source_candidates(vm, all_candidates)
+                    if (
+                        len(candidates) != 1
+                        or candidates[0]["id"] != record["id"]
+                        or not self.owned(candidates[0], vm)
+                        or object_id(candidates[0].get("cluster")) != cid
+                    ):
                         raise SafetyError("Bootstrap candidate set changed")
+                    self.duplicates(vm, record, cid, all_candidates)
                     self.store.bind(vm, record["id"], cid)
                 bound.add(record["id"])
             except SafetyError as exc:
@@ -217,7 +233,7 @@ class Engine:
             try:
                 row = self.mappings.get(vm.key)
                 if row is None:
-                    candidates = self.by_name[vm.name.casefold()]
+                    candidates = self.source_candidates(vm, self.by_name[vm.name.casefold()])
                     if len(candidates) > 1:
                         ids = [(r["id"], object_id(r.get("cluster"))) for r in candidates]
                         raise SafetyError(
