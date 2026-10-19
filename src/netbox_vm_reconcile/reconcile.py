@@ -7,7 +7,7 @@ from collections import Counter, defaultdict
 from .config import Config
 from .identity import VM, SafetyError, inventory_diff, object_id, uuid, validate_inventory
 from .mappings import Store
-from .placement import Placement, owned
+from .placement import Placement, owned, placement_diff
 
 LOG = logging.getLogger(__name__)
 
@@ -258,13 +258,23 @@ class Engine:
                 self.duplicates(vm, record, cid)
                 changes = self.delta(vm, record, cid, did, sid)
                 if changes:
+                    differences = {
+                        field: {
+                            "old": record.get(field)
+                            if field == "name"
+                            else object_id(record.get(field)),
+                            "new": value,
+                        }
+                        for field, value in changes.items()
+                    }
                     LOG.info(
-                        "%s VM=%s UUID=%s NetBox ID=%s PATCH=%s",
-                        "APPLY" if apply else "DRY-RUN",
+                        "%s VM=%s UUID=%s NetBox ID=%s PATCH=%s CHANGES=%s",
+                        "APPLY PLAN" if apply else "DRY-RUN",
                         vm.name,
                         vm.instance_uuid,
                         record["id"],
                         changes,
+                        differences,
                     )
                     if check:
                         raise SafetyError("Placement drift requires reconciliation")
@@ -275,7 +285,22 @@ class Engine:
                         if current != record:
                             raise SafetyError("NetBox VM changed concurrently; rerun required")
                         cluster, device = self.netbox.placement(cid, did)
-                        if cluster != self.clusters[cid] or device != self.devices[did]:
+                        source = self.sources[vm.source]
+                        target_changes = {
+                            "Cluster": placement_diff(
+                                self.clusters[cid], cluster, "Cluster", source
+                            ),
+                            "Device": placement_diff(self.devices[did], device, "Device", source),
+                        }
+                        if any(target_changes.values()):
+                            for kind, changed in target_changes.items():
+                                if changed:
+                                    LOG.error(
+                                        "Target %s changed source=%s fields=%s",
+                                        kind,
+                                        vm.source,
+                                        json.dumps(changed, ensure_ascii=False),
+                                    )
                             raise SafetyError("Target Cluster/Device changed concurrently")
                         self.validate_placement(cluster, device, cid, did)
                         if object_id(device["site"]) != sid:
@@ -289,6 +314,13 @@ class Engine:
                         if self.delta(vm, confirmed, cid, did, sid):
                             raise SafetyError("PATCH result does not match desired placement")
                         self.identity(vm, row, confirmed)
+                        LOG.info(
+                            "APPLIED VM=%s UUID=%s NetBox ID=%s PATCH=%s",
+                            vm.name,
+                            vm.instance_uuid,
+                            record["id"],
+                            changes,
+                        )
                         # Keep in-memory conflict indices current after a successful rename.
                         self.by_name[record["name"].casefold()] = [
                             r
