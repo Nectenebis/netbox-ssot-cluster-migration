@@ -1,6 +1,6 @@
 """Identity and shared safety primitives; no remote mutations."""
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any
 from uuid import UUID
 
@@ -49,3 +49,33 @@ def validate_inventory(vms: list[VM]) -> None:
             raise SafetyError(f"Duplicate VMware UUID: source={vm.source} VM={vm.name}")
         keys.add(vm.key)
         bios.add(vm.bios_uuid)
+
+
+def inventory_diff(before: list[VM], after: list[VM]) -> list[dict]:
+    """Describe snapshot differences without guessing identities from names or MoRefs."""
+    old_by_key = {vm.key: vm for vm in before}
+    new_by_key = {vm.key: vm for vm in after}
+    changes = []
+    for key in sorted(old_by_key.keys() | new_by_key.keys()):
+        old, new = old_by_key.get(key), new_by_key.get(key)
+        if old is None and new is not None:
+            changes.append({"kind": "added", "vm": asdict(new)})
+        elif new is None and old is not None:
+            changes.append({"kind": "removed", "vm": asdict(old)})
+        elif old is not None and new is not None and old != new:
+            old_fields, new_fields = asdict(old), asdict(new)
+            changes.append(
+                {
+                    "kind": "modified",
+                    "source": new.source,
+                    "name": new.name,
+                    "vcenter_uuid": new.vcenter_uuid,
+                    "instance_uuid": new.instance_uuid,
+                    "fields": {
+                        field: {"old": old_fields[field], "new": new_fields[field]}
+                        for field in old_fields
+                        if old_fields[field] != new_fields[field]
+                    },
+                }
+            )
+    return changes

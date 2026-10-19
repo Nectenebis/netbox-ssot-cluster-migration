@@ -1,14 +1,22 @@
 """Plan and execute conservative updates, without owning any VM network resources."""
 
+import json
 import logging
 from collections import Counter, defaultdict
 
 from .config import Config
-from .identity import VM, SafetyError, object_id, uuid, validate_inventory
+from .identity import VM, SafetyError, inventory_diff, object_id, uuid, validate_inventory
 from .mappings import Store
 from .placement import Placement, owned
 
 LOG = logging.getLogger(__name__)
+
+
+def log_inventory_diff(before: list[VM], after: list[VM]) -> bool:
+    changes = inventory_diff(before, after)
+    for change in changes:
+        LOG.error("VMware inventory difference: %s", json.dumps(change, ensure_ascii=False))
+    return bool(changes)
 
 
 class Engine:
@@ -261,7 +269,7 @@ class Engine:
                     if check:
                         raise SafetyError("Placement drift requires reconciliation")
                     if apply:
-                        if self.vmware.refresh(vm) != vm:
+                        if log_inventory_diff([vm], [self.vmware.refresh(vm)]):
                             raise SafetyError("VMware VM changed during processing; rerun required")
                         current = self.netbox.get_vm(record["id"])
                         if current != record:
@@ -296,7 +304,7 @@ class Engine:
         try:
             final_inventory = self.vmware.inventory()
             validate_inventory(final_inventory)
-            if {v.key: v for v in final_inventory} != self.vm_by_key:
+            if log_inventory_diff(self.vms, final_inventory):
                 raise SafetyError("VMware inventory changed during run; SSoT must remain stopped")
         except SafetyError as exc:
             errors += 1
