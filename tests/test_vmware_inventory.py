@@ -56,3 +56,26 @@ def test_vmware_template_excluded_and_standalone_rejected(env):
     hosts = {"host-201": {"parent": vim.ComputeResource("domain-s1")}}
     with pytest.raises(SafetyError, match="Standalone"):
         reader._vm(env.cfg.vcenters[0], row, hosts)
+
+
+def test_inventory_presence_includes_ignored_templates(env, monkeypatch):
+    def properties(content, kind, paths, objects=None):
+        if kind != vim.VirtualMachine:
+            return []
+        return [
+            NS(
+                obj=vim.VirtualMachine("vm-template"),
+                missingSet=[],
+                propSet=[
+                    NS(name="config.template", val=True),
+                    NS(name="config.instanceUuid", val=env.vm.instance_uuid),
+                ],
+            )
+        ]
+
+    monkeypatch.setattr("netbox_vm_reconcile.vmware.properties", properties)
+    reader = VMware(env.cfg.vcenters)
+    reader.sessions[env.vm.source] = (env.cfg.vcenters[0], MagicMock())
+    reader.vcenter_uuids[env.vm.source] = env.vm.vcenter_uuid
+    assert reader.inventory() == []
+    assert reader.present_keys() == {env.vm.key}

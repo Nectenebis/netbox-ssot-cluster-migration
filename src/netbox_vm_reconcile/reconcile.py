@@ -3,6 +3,8 @@
 import json
 import logging
 from collections import Counter, defaultdict
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 
 from .config import Config
 from .identity import VM, SafetyError, inventory_diff, object_id, uuid, validate_inventory
@@ -10,6 +12,15 @@ from .mappings import Store
 from .placement import Placement, owned, placement_diff
 
 LOG = logging.getLogger(__name__)
+
+
+@dataclass
+class MappingPlan:
+    bindings: list[tuple[VM, int, int]] = dataclass_field(default_factory=list)
+    pending: set[tuple[str, str]] = dataclass_field(default_factory=set)
+    blocked: set[tuple[str, str]] = dataclass_field(default_factory=set)
+    removals: list[dict] = dataclass_field(default_factory=list)
+    errors: int = 0
 
 
 def log_inventory_diff(before: list[VM], after: list[VM]) -> bool:
@@ -48,9 +59,16 @@ class Engine:
         self.vm_names = Counter((v.source, v.name.casefold()) for v in self.vms)
         self.mappings = {(m["vcenter_uuid"], m["vm_instance_uuid"]): m for m in store.rows()}
         self.vm_by_key = {v.key: v for v in self.vms}
+        self.present = vmware.present_keys()
+        if not self.vm_by_key.keys() <= self.present:
+            raise SafetyError("Incomplete VMware presence inventory")
+        self.history_bios: dict[str, list[dict]] = defaultdict(list)
+        self.history_names: dict[tuple[str, str], list[dict]] = defaultdict(list)
         for key, row in self.mappings.items():
             if self.registered.get(row["source_name"]) != key[0]:
                 raise SafetyError("Mapped vCenter UUID/source missing from configuration")
+            self.history_bios[row["vm_bios_uuid"]].append(row)
+            self.history_names[row["source_name"], row["last_known_name"].casefold()].append(row)
 
     def owned(self, record: dict, vm: VM) -> bool:
         return owned(record, self.sources[vm.source])
@@ -60,17 +78,17 @@ class Engine:
         # ambiguity instead of silently hiding a possible duplicate.
         return [r for r in candidates if (r.get("custom_fields") or {}).get("source") == vm.source]
 
-    def register_sources(self, apply: bool, names=None) -> None:
+    def register_sources(self, apply: bool, names=None, persist: bool = True) -> None:
         selected = self.observed if names is None else {n: self.observed[n] for n in names}
         for name, observed in selected.items():
             if name not in self.registered:
                 LOG.info(
                     "%s register vCenter source=%s UUID=%s",
-                    "APPLY" if apply else "DRY-RUN",
+                    "APPLY PLAN" if apply else "DRY-RUN",
                     name,
                     observed,
                 )
-        if apply:
+        if apply and persist:
             self.store.register_vcenters(selected)
             self.registered.update(selected)
 
@@ -139,24 +157,39 @@ class Engine:
                 changes[field] = value
         return changes
 
-    def bootstrap_candidate(self, vm: VM) -> tuple[dict, int]:
-        cid, _, _ = self.targets(vm)
-        all_candidates = self.by_name[vm.name.casefold()]
+    def bootstrap_candidate(self, vm: VM, all_candidates=None) -> tuple[dict, int] | None:
+        if all_candidates is None:
+            all_candidates = self.by_name[vm.name.casefold()]
         candidates = self.source_candidates(vm, all_candidates)
-        if self.vm_names[vm.source, vm.name.casefold()] != 1 or len(candidates) != 1:
+        if self.vm_names[vm.source, vm.name.casefold()] != 1 or len(candidates) > 1:
             ids = [(r["id"], object_id(r.get("cluster"))) for r in candidates]
             raise SafetyError(
-                f"Ambiguous/missing bootstrap candidate source={vm.source} VM={vm.name}: {ids}"
+                f"{'DUPLICATE DETECTED: ' if len(candidates) > 1 else ''}"
+                f"Ambiguous bootstrap candidate source={vm.source} VM={vm.name}: {ids}"
             )
+        if not candidates:
+            if all_candidates:
+                cid = self.placement.resolve(
+                    "Cluster", self.sources[vm.source], vm.cluster_ref, vm.cluster_name
+                )
+                if any(
+                    not (r.get("custom_fields") or {}).get("source")
+                    or object_id(r.get("cluster")) == cid
+                    for r in all_candidates
+                ):
+                    raise SafetyError(f"Possible foreign/unowned NetBox candidate for {vm.name}")
+            return None
+        cid, _, _ = self.targets(vm)
         record = candidates[0]
         if not self.owned(record, vm) or object_id(record.get("cluster")) != cid:
             raise SafetyError(f"Bootstrap ownership/cluster mismatch for {vm.name}; bind manually")
         self.duplicates(vm, record, cid, all_candidates)
         return record, cid
 
-    def bootstrap(self, apply: bool = False) -> int:
-        self.register_sources(apply)
-        errors = 0
+    def plan_mappings(self, apply: bool) -> MappingPlan:
+        plan = MappingPlan(
+            removals=[r for key, r in self.mappings.items() if key not in self.present]
+        )
         bound = {r["netbox_vm_id"] for r in self.mappings.values()}
         for vm in self.vms:
             try:
@@ -167,12 +200,38 @@ class Engine:
                         raise SafetyError("Mapped NetBox VM is missing")
                     self.identity(vm, row, existing)
                     continue
-                record, cid = self.bootstrap_candidate(vm)
+                if (
+                    self.history_bios[vm.bios_uuid]
+                    or self.history_names[vm.source, vm.name.casefold()]
+                ):
+                    raise SafetyError(
+                        f"Unregistered VMware UUID={vm.instance_uuid} VM={vm.name}; "
+                        "possible identity change/reused name or BIOS UUID; manual review required"
+                    )
+                candidate = self.bootstrap_candidate(vm)
+                if candidate is None:
+                    if (
+                        apply
+                        and self.bootstrap_candidate(vm, self.netbox.named(vm.name)) is not None
+                    ):
+                        raise SafetyError(
+                            "NetBox candidate appeared during discovery; rerun required"
+                        )
+                    LOG.info(
+                        "NEW VM source=%s VM=%s UUID=%s absent from NetBox; left for SSoT",
+                        vm.source,
+                        vm.name,
+                        vm.instance_uuid,
+                    )
+                    plan.pending.add(vm.key)
+                    continue
+                record, cid = candidate
                 if record["id"] in bound:
                     raise SafetyError("NetBox VM is already mapped to another VMware identity")
                 LOG.info(
-                    "%s BIND UUID=%s NetBox ID=%s VM=%s",
-                    "APPLY" if apply else "DRY-RUN",
+                    "%s BIND source=%s UUID=%s NetBox ID=%s VM=%s",
+                    "APPLY PLAN" if apply else "DRY-RUN",
+                    vm.source,
                     vm.instance_uuid,
                     record["id"],
                     vm.name,
@@ -183,22 +242,95 @@ class Engine:
                     current = self.netbox.get_vm(record["id"])
                     if current != record:
                         raise SafetyError("NetBox candidate changed during bootstrap")
-                    all_candidates = self.netbox.named(vm.name)
-                    candidates = self.source_candidates(vm, all_candidates)
-                    if (
-                        len(candidates) != 1
-                        or candidates[0]["id"] != record["id"]
-                        or not self.owned(candidates[0], vm)
-                        or object_id(candidates[0].get("cluster")) != cid
+                    refreshed = self.bootstrap_candidate(vm, self.netbox.named(vm.name))
+                    if refreshed is None or (refreshed[0]["id"], refreshed[1]) != (
+                        record["id"],
+                        cid,
                     ):
                         raise SafetyError("Bootstrap candidate set changed")
-                    self.duplicates(vm, record, cid, all_candidates)
-                    self.store.bind(vm, record["id"], cid)
+                plan.bindings.append((vm, record["id"], cid))
                 bound.add(record["id"])
             except SafetyError as exc:
-                errors += 1
-                LOG.error("%s", exc)
+                plan.errors += 1
+                plan.blocked.add(vm.key)
+                LOG.error("source=%s VM=%s: %s", vm.source, vm.name, exc)
+        for row in plan.removals:
+            LOG.info(
+                "%s REMOVE MAPPING source=%s UUID=%s NetBox ID=%s; NetBox object untouched",
+                "STATE PLAN" if apply else "DRY-RUN",
+                row["source_name"],
+                row["vm_instance_uuid"],
+                row["netbox_vm_id"],
+            )
+        return plan
+
+    def finish_mappings(
+        self,
+        plan: MappingPlan,
+        apply: bool,
+        errors: int,
+        seen: list[tuple[VM, int]],
+        accepted: set[tuple[str, str]],
+        register: bool = False,
+    ) -> int:
+        stable = True
+        final_present = self.present
+        try:
+            final_inventory = self.vmware.inventory()
+            validate_inventory(final_inventory)
+            final_present = self.vmware.present_keys()
+            if not {v.key for v in final_inventory} <= final_present:
+                raise SafetyError("Incomplete final VMware presence inventory")
+            if log_inventory_diff(self.vms, final_inventory):
+                raise SafetyError("VMware inventory changed during run; SSoT must remain stopped")
+        except SafetyError as exc:
+            stable = False
+            errors += 1
+            LOG.error("%s", exc)
+        bindings = [b for b in plan.bindings if b[0].key in accepted] if stable else []
+        removals = (
+            [
+                r
+                for r in plan.removals
+                if (r["vcenter_uuid"], r["vm_instance_uuid"]) not in final_present
+            ]
+            if stable and not errors
+            else []
+        )
+        if plan.removals and (not stable or errors):
+            LOG.warning("Mapping cleanup deferred because checks failed; existing rows retained")
+        if apply:
+            self.store.apply_batch(
+                bindings,
+                [(r["vcenter_uuid"], r["vm_instance_uuid"], r["netbox_vm_id"]) for r in removals],
+                seen,
+                self.observed if register and stable else None,
+            )
+            if register and stable:
+                self.registered.update(self.observed)
+            for vm, pk, _ in bindings:
+                LOG.info("BOUND source=%s UUID=%s NetBox ID=%s", vm.source, vm.instance_uuid, pk)
+            for row in removals:
+                LOG.info(
+                    "REMOVED MAPPING source=%s UUID=%s NetBox ID=%s; NetBox untouched",
+                    row["source_name"],
+                    row["vm_instance_uuid"],
+                    row["netbox_vm_id"],
+                )
+        LOG.info(
+            "Checked %d VMware VMs; pending SSoT creation=%d; errors=%d",
+            len(self.vms),
+            len(plan.pending),
+            errors,
+        )
         return 2 if errors else 0
+
+    def bootstrap(self, apply: bool = False) -> int:
+        self.register_sources(apply, persist=False)
+        plan = self.plan_mappings(apply)
+        return self.finish_mappings(
+            plan, apply, plan.errors, [], {vm.key for vm, _, _ in plan.bindings}, register=True
+        )
 
     def bind(self, source: str, instance_uuid: str, pk: int, apply: bool) -> None:
         matches = [v for v in self.vms if v.source == source and v.instance_uuid == instance_uuid]
@@ -231,27 +363,27 @@ class Engine:
     def reconcile(self, apply: bool = False, check: bool = False) -> int:
         if set(self.observed) - set(self.registered):
             raise SafetyError("Unregistered vCenter UUID; run bootstrap --dry-run then --apply")
-        errors = 0
-        for key, absent_row in self.mappings.items():
-            if key not in self.vm_by_key:
-                LOG.warning(
-                    "Mapped VM absent in VMware; retained NetBox ID=%s", absent_row["netbox_vm_id"]
-                )
+        plan = self.plan_mappings(apply)
+        errors = plan.errors
+        staged_rows = {
+            vm.key: {
+                "vcenter_uuid": vm.vcenter_uuid,
+                "vm_instance_uuid": vm.instance_uuid,
+                "vm_bios_uuid": vm.bios_uuid,
+                "netbox_vm_id": pk,
+                "source_name": vm.source,
+            }
+            for vm, pk, _ in plan.bindings
+        }
+        seen: list[tuple[VM, int]] = []
+        accepted = set()
         for vm in self.vms:
+            if vm.key in plan.pending or vm.key in plan.blocked:
+                continue
             try:
-                row = self.mappings.get(vm.key)
+                row = self.mappings.get(vm.key) or staged_rows.get(vm.key)
                 if row is None:
-                    candidates = self.source_candidates(vm, self.by_name[vm.name.casefold()])
-                    if len(candidates) > 1:
-                        ids = [(r["id"], object_id(r.get("cluster"))) for r in candidates]
-                        raise SafetyError(
-                            f"DUPLICATE DETECTED UUID={vm.instance_uuid} "
-                            f"NetBox (ID, Cluster)={ids}; manual resolution required"
-                        )
-                    raise SafetyError(
-                        f"Unregistered VMware UUID={vm.instance_uuid} VM={vm.name}; "
-                        "bootstrap/manual review required"
-                    )
+                    raise SafetyError("Mapping discovery did not classify the VMware VM")
                 cid, did, sid = self.targets(vm)
                 record = self.netbox.get_vm(row["netbox_vm_id"])
                 self.identity(vm, row, record)
@@ -328,18 +460,10 @@ class Engine:
                             if r["id"] != record["id"]
                         ]
                         self.by_name[vm.name.casefold()].append(confirmed)
+                accepted.add(vm.key)
                 if apply:
-                    self.store.seen(vm, cid)
+                    seen.append((vm, cid))
             except SafetyError as exc:
                 errors += 1
                 LOG.error("VM=%s UUID=%s: %s", vm.name, vm.instance_uuid, exc)
-        try:
-            final_inventory = self.vmware.inventory()
-            validate_inventory(final_inventory)
-            if log_inventory_diff(self.vms, final_inventory):
-                raise SafetyError("VMware inventory changed during run; SSoT must remain stopped")
-        except SafetyError as exc:
-            errors += 1
-            LOG.error("%s", exc)
-        LOG.info("Checked %d VMware VMs; errors=%d", len(self.vms), errors)
-        return 2 if errors else 0
+        return self.finish_mappings(plan, apply, errors, seen, accepted)

@@ -172,11 +172,13 @@ def test_netbox_failure_prevents_writes(env, monkeypatch):
     assert not env.nb.patches
 
 
-def test_absent_vm_mapping_is_retained(env):
+def test_absent_vm_mapping_is_removed_without_touching_netbox(env):
     env.bind()
     env.vw.vms = []
     assert env.engine().reconcile(True) == 0
-    assert len(env.store.rows()) == 1
+    assert not env.store.rows()
+    assert 3219 in env.nb.records
+    assert not env.nb.patches
 
 
 def test_check_reports_drift_without_patch(env):

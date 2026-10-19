@@ -36,9 +36,13 @@ class FakeVMware:
         self.vms = vms
         self.refresh_override = None
         self.vcenter_uuids = {v.source: v.vcenter_uuid for v in vms}
+        self.excluded_keys = set()
 
     def identities(self):
         return {**self.vcenter_uuids, **{v.source: v.vcenter_uuid for v in self.vms}}
+
+    def present_keys(self):
+        return {v.key for v in self.vms} | self.excluded_keys
 
     def inventory(self):
         return self.vms

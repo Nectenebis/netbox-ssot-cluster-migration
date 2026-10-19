@@ -128,19 +128,59 @@ class Store:
     def register_vcenters(self, identities: dict[str, str]) -> None:
         try:
             with self.db:
-                for source, observed in identities.items():
-                    row = self.db.execute(
-                        "SELECT vcenter_uuid FROM vcenters WHERE source_name=?", (source,)
-                    ).fetchone()
-                    if row and row[0] != observed:
-                        raise SafetyError(f"Registered vCenter UUID changed for source={source}")
-                    if not row:
-                        self.db.execute(
-                            "INSERT INTO vcenters (source_name, vcenter_uuid) VALUES (?, ?)",
-                            (source, observed),
-                        )
+                self._register_vcenters(identities)
         except sqlite3.IntegrityError as exc:
             raise SafetyError("vCenter UUID already belongs to another registered source") from exc
+
+    def _register_vcenters(self, identities: dict[str, str]) -> None:
+        for source, observed in identities.items():
+            row = self.db.execute(
+                "SELECT vcenter_uuid FROM vcenters WHERE source_name=?", (source,)
+            ).fetchone()
+            if row and row[0] != observed:
+                raise SafetyError(f"Registered vCenter UUID changed for source={source}")
+            if not row:
+                self.db.execute(
+                    "INSERT INTO vcenters (source_name, vcenter_uuid) VALUES (?, ?)",
+                    (source, observed),
+                )
+
+    def apply_batch(
+        self,
+        bindings: list[tuple[VM, int, int]],
+        removals: list[tuple[str, str, int]],
+        seen: list[tuple[VM, int]],
+        registrations: dict[str, str] | None = None,
+    ) -> None:
+        """Commit verified lifecycle changes once; any failure rolls back the whole batch."""
+        try:
+            with self.db:
+                self._register_vcenters(registrations or {})
+                registered = self.vcenters()
+                if any(registered.get(vm.source) != vm.vcenter_uuid for vm, _, _ in bindings):
+                    raise SafetyError("VM must belong to a registered vCenter identity")
+                self.db.executemany(
+                    """INSERT INTO mappings (vcenter_uuid, vm_instance_uuid, vm_bios_uuid,
+                       netbox_vm_id, source_name, last_known_name, last_known_cluster_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    [
+                        (*vm.key, vm.bios_uuid, pk, vm.source, vm.name, cid)
+                        for vm, pk, cid in bindings
+                    ],
+                )
+                self.db.executemany(
+                    """DELETE FROM mappings WHERE vcenter_uuid=? AND vm_instance_uuid=?
+                       AND netbox_vm_id=?""",
+                    removals,
+                )
+                self.db.executemany(
+                    """UPDATE mappings SET last_known_name=?, last_known_cluster_id=?,
+                       last_seen=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
+                       WHERE vcenter_uuid=? AND vm_instance_uuid=?""",
+                    [(vm.name, cid, *vm.key) for vm, cid in seen],
+                )
+        except sqlite3.IntegrityError as exc:
+            raise SafetyError("Mapping batch conflicts; all SQLite changes rolled back") from exc
 
     def rows(self) -> list[dict]:
         return [

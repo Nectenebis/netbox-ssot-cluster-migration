@@ -146,8 +146,8 @@ def test_other_source_is_not_a_false_duplicate_in_conflicts(same_names, caplog):
     env = same_names
     # Register the second vCenter, but leave both VM mappings absent.
     env.store.register_vcenters(env.vw.identities())
-    assert env.engine().reconcile() == 2
-    assert "Unregistered VMware UUID" in caplog.text
+    assert env.engine().reconcile() == 0
+    assert not env.store.rows()  # Dry-run simulates both independent automatic bindings.
     assert "DUPLICATE DETECTED" not in caplog.text
 
 

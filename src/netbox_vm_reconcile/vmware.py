@@ -69,9 +69,14 @@ class VMware:
         self.objects: dict = {}
         self.vcenter_uuids: dict[str, str] = {}
         self.cluster_names: dict[str, dict[str, str]] = {}
+        self.present: set[tuple[str, str]] = set()
 
     def identities(self) -> dict[str, str]:
         return dict(self.vcenter_uuids)
+
+    def present_keys(self) -> set[tuple[str, str]]:
+        """Include excluded templates so filtering is never mistaken for deletion."""
+        return set(self.present)
 
     def __enter__(self):
         try:
@@ -145,6 +150,7 @@ class VMware:
     def inventory(self) -> list[VM]:
         try:
             result = []
+            present = set()
             for name, (config, content) in self.sessions.items():
                 self.cluster_names[name] = {
                     r.obj._moId: values(r)["name"]
@@ -155,11 +161,18 @@ class VMware:
                     for r in properties(content, vim.HostSystem, ["name", "parent"])
                 }
                 for row in properties(content, vim.VirtualMachine, VM_PATHS):
+                    present.add(
+                        (
+                            self.vcenter_uuids.get(name) or uuid(config.expected_uuid),
+                            uuid(values(row).get("config.instanceUuid")),
+                        )
+                    )
                     vm = self._vm(config, row, hosts)
                     if vm:
                         result.append(vm)
                         self.objects[(name, vm.moref)] = row.obj
             validate_inventory(result)
+            self.present = present
             return result
         except SafetyError:
             raise
