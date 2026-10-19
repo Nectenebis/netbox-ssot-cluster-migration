@@ -89,11 +89,12 @@ def test_final_inventory_error_names_the_vm_and_changed_host(env, monkeypatch, c
     assert env.cfg.database.read_bytes() == before
 
 
-def test_pre_patch_change_is_logged_and_not_applied(env, caplog):
+def test_persistently_inconsistent_pre_patch_inventory_is_logged_and_not_applied(env, caplog):
     env.bind()
     env.migrate(name="new-name")
     env.vw.refresh_override = replace(env.vw.vms[0], host_ref="host-202")
     assert env.engine().reconcile(True) == 2
     assert '"host_ref": {"old": "host-201", "new": "host-202"}' in caplog.text
-    assert "VMware VM changed during processing" in caplog.text
+    assert "attempt=2/3" in caplog.text and "attempt=3/3" in caplog.text
+    assert "placement kept changing after 3 attempts" in caplog.text
     assert not env.nb.patches

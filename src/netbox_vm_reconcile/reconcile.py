@@ -12,6 +12,12 @@ from .mappings import Store
 from .placement import Placement, owned, placement_diff
 
 LOG = logging.getLogger(__name__)
+RECONCILE_ATTEMPTS = 3
+PLACEMENT_FIELDS = {"host_ref", "host_name", "cluster_ref", "cluster_name"}
+
+
+class PlacementChanged(SafetyError):
+    """A fresh inventory and reconciliation plan may resolve a concurrent vMotion."""
 
 
 @dataclass
@@ -23,10 +29,24 @@ class MappingPlan:
     errors: int = 0
 
 
-def log_inventory_diff(before: list[VM], after: list[VM]) -> bool:
+def log_inventory_diff(before: list[VM], after: list[VM], retry_placement: bool = False) -> bool:
     changes = inventory_diff(before, after)
+    retry = (
+        retry_placement
+        and bool(changes)
+        and all(
+            change["kind"] == "modified" and set(change["fields"]) <= PLACEMENT_FIELDS
+            for change in changes
+        )
+    )
     for change in changes:
-        LOG.error("VMware inventory difference: %s", json.dumps(change, ensure_ascii=False))
+        LOG.log(
+            logging.INFO if retry else logging.ERROR,
+            "VMware inventory difference: %s",
+            json.dumps(change, ensure_ascii=False),
+        )
+    if retry:
+        raise PlacementChanged("VMware placement changed during reconciliation")
     return bool(changes)
 
 
@@ -186,7 +206,7 @@ class Engine:
         self.duplicates(vm, record, cid, all_candidates)
         return record, cid
 
-    def plan_mappings(self, apply: bool) -> MappingPlan:
+    def plan_mappings(self, apply: bool, retry_placement: bool = False) -> MappingPlan:
         plan = MappingPlan(
             removals=[r for key, r in self.mappings.items() if key not in self.present]
         )
@@ -237,7 +257,7 @@ class Engine:
                     vm.name,
                 )
                 if apply:
-                    if self.vmware.refresh(vm) != vm:
+                    if log_inventory_diff([vm], [self.vmware.refresh(vm)], retry_placement):
                         raise SafetyError("VM changed during bootstrap; rerun required")
                     current = self.netbox.get_vm(record["id"])
                     if current != record:
@@ -250,6 +270,8 @@ class Engine:
                         raise SafetyError("Bootstrap candidate set changed")
                 plan.bindings.append((vm, record["id"], cid))
                 bound.add(record["id"])
+            except PlacementChanged:
+                raise
             except SafetyError as exc:
                 plan.errors += 1
                 plan.blocked.add(vm.key)
@@ -281,8 +303,12 @@ class Engine:
             final_present = self.vmware.present_keys()
             if not {v.key for v in final_inventory} <= final_present:
                 raise SafetyError("Incomplete final VMware presence inventory")
-            if log_inventory_diff(self.vms, final_inventory):
+            if log_inventory_diff(
+                self.vms, final_inventory, retry_placement=apply and not register and not errors
+            ):
                 raise SafetyError("VMware inventory changed during run; SSoT must remain stopped")
+        except PlacementChanged:
+            raise
         except SafetyError as exc:
             stable = False
             errors += 1
@@ -361,9 +387,34 @@ class Engine:
             self.store.bind(vm, pk, cid)
 
     def reconcile(self, apply: bool = False, check: bool = False) -> int:
+        engine = self
+        for attempt in range(1, RECONCILE_ATTEMPTS + 1):
+            try:
+                if attempt > 1:
+                    # Re-read both systems and rebuild all ownership/conflict/placement indices.
+                    # Confirmed NetBox PATCHes from an earlier attempt remain and are idempotent.
+                    engine = Engine(self.config, self.store, self.vmware, self.netbox)
+                return engine._reconcile_once(apply, check)
+            except PlacementChanged:
+                if attempt == RECONCILE_ATTEMPTS:
+                    LOG.error(
+                        "VMware placement kept changing after %d attempts; "
+                        "SQLite lifecycle changes not committed; SSoT must remain stopped",
+                        RECONCILE_ATTEMPTS,
+                    )
+                    return 2
+                LOG.warning(
+                    "VMware placement changed; refreshing VMware and NetBox and retrying "
+                    "reconciliation attempt=%d/%d",
+                    attempt + 1,
+                    RECONCILE_ATTEMPTS,
+                )
+        raise AssertionError("Unreachable reconciliation attempt")
+
+    def _reconcile_once(self, apply: bool, check: bool) -> int:
         if set(self.observed) - set(self.registered):
             raise SafetyError("Unregistered vCenter UUID; run bootstrap --dry-run then --apply")
-        plan = self.plan_mappings(apply)
+        plan = self.plan_mappings(apply, retry_placement=apply)
         errors = plan.errors
         staged_rows = {
             vm.key: {
@@ -411,7 +462,9 @@ class Engine:
                     if check:
                         raise SafetyError("Placement drift requires reconciliation")
                     if apply:
-                        if log_inventory_diff([vm], [self.vmware.refresh(vm)]):
+                        if log_inventory_diff(
+                            [vm], [self.vmware.refresh(vm)], retry_placement=True
+                        ):
                             raise SafetyError("VMware VM changed during processing; rerun required")
                         current = self.netbox.get_vm(record["id"])
                         if current != record:
@@ -463,6 +516,8 @@ class Engine:
                 accepted.add(vm.key)
                 if apply:
                     seen.append((vm, cid))
+            except PlacementChanged:
+                raise
             except SafetyError as exc:
                 errors += 1
                 LOG.error("VM=%s UUID=%s: %s", vm.name, vm.instance_uuid, exc)
