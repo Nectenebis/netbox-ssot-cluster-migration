@@ -70,10 +70,9 @@ def test_foreign_sources_untouched(env, kind):
     assert not env.nb.patches
 
 
-@pytest.mark.parametrize("field", ["bios_uuid", "instance_uuid"])
-def test_changed_uuid_requires_manual_review(env, field):
+def test_changed_bios_uuid_of_same_instance_requires_manual_review(env):
     env.bind()
-    env.migrate(**{field: "44444444-4444-4444-8444-444444444444", "name": "renamed"})
+    env.migrate(bios_uuid="44444444-4444-4444-8444-444444444444", name="renamed")
     assert env.engine().reconcile(True) == 2
     assert not env.nb.patches
 

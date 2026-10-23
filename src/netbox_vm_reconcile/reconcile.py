@@ -78,6 +78,7 @@ class Engine:
             self.by_name[r["name"].casefold()].append(r)
         self.vm_names = Counter((v.source, v.name.casefold()) for v in self.vms)
         self.mappings = {(m["vcenter_uuid"], m["vm_instance_uuid"]): m for m in store.rows()}
+        self.mapping_by_id = {m["netbox_vm_id"]: m for m in self.mappings.values()}
         self.vm_by_key = {v.key: v for v in self.vms}
         self.present = vmware.present_keys()
         if not self.vm_by_key.keys() <= self.present:
@@ -206,6 +207,51 @@ class Engine:
         self.duplicates(vm, record, cid, all_candidates)
         return record, cid
 
+    def defer_replacement(self, vm: VM, previous: list[dict], plan: MappingPlan, apply: bool):
+        """Let SSoT settle a replacement before enrolling its current NetBox identity."""
+        for row in previous:
+            key = row["vcenter_uuid"], row["vm_instance_uuid"]
+            if key in self.present or row["source_name"] != vm.source:
+                raise SafetyError(
+                    "Previous VMware identity is still present or belongs to another source; "
+                    "manual review required"
+                )
+        if self.vm_names[vm.source, vm.name.casefold()] != 1:
+            raise SafetyError("Ambiguous replacement name in VMware; manual review required")
+        snapshots = [self.by_name[vm.name.casefold()]]
+        if apply:
+            snapshots.append(self.netbox.named(vm.name))
+        for records in snapshots:
+            candidates = self.source_candidates(vm, records)
+            if len(candidates) > 1:
+                raise SafetyError("DUPLICATE DETECTED: multiple NetBox replacement candidates")
+            for record in candidates:
+                if not self.owned(record, vm):
+                    raise SafetyError("Replacement NetBox ownership mismatch")
+                bound = self.mapping_by_id.get(record["id"])
+                if bound and (bound["vcenter_uuid"], bound["vm_instance_uuid"]) in self.present:
+                    raise SafetyError("Replacement NetBox ID belongs to a present VMware VM")
+            foreign = [r for r in records if r not in candidates]
+            if foreign:
+                cid = self.placement.resolve(
+                    "Cluster", self.sources[vm.source], vm.cluster_ref, vm.cluster_name
+                )
+                if any(
+                    not (r.get("custom_fields") or {}).get("source")
+                    or object_id(r.get("cluster")) == cid
+                    for r in foreign
+                ):
+                    raise SafetyError("Replacement conflicts with a foreign/unowned NetBox VM")
+        LOG.info(
+            "RECREATED VM source=%s VM=%s UUID=%s previous UUIDs=%s; "
+            "old identities absent from VMware; left for SSoT; NetBox untouched",
+            vm.source,
+            vm.name,
+            vm.instance_uuid,
+            sorted({r["vm_instance_uuid"] for r in previous}),
+        )
+        plan.pending.add(vm.key)
+
     def plan_mappings(self, apply: bool, retry_placement: bool = False) -> MappingPlan:
         plan = MappingPlan(
             removals=[r for key, r in self.mappings.items() if key not in self.present]
@@ -220,14 +266,18 @@ class Engine:
                         raise SafetyError("Mapped NetBox VM is missing")
                     self.identity(vm, row, existing)
                     continue
-                if (
+                previous = (
                     self.history_bios[vm.bios_uuid]
-                    or self.history_names[vm.source, vm.name.casefold()]
-                ):
-                    raise SafetyError(
-                        f"Unregistered VMware UUID={vm.instance_uuid} VM={vm.name}; "
-                        "possible identity change/reused name or BIOS UUID; manual review required"
-                    )
+                    + self.history_names[vm.source, vm.name.casefold()]
+                )
+                candidates = self.source_candidates(vm, self.by_name[vm.name.casefold()])
+                if len(candidates) == 1:
+                    previous_row = self.mapping_by_id.get(candidates[0]["id"])
+                    if previous_row:
+                        previous.append(previous_row)
+                if previous:
+                    self.defer_replacement(vm, previous, plan, apply)
+                    continue
                 candidate = self.bootstrap_candidate(vm)
                 if candidate is None:
                     if (
@@ -247,6 +297,10 @@ class Engine:
                     continue
                 record, cid = candidate
                 if record["id"] in bound:
+                    previous_row = self.mapping_by_id.get(record["id"])
+                    if previous_row:
+                        self.defer_replacement(vm, [previous_row], plan, apply)
+                        continue
                     raise SafetyError("NetBox VM is already mapped to another VMware identity")
                 LOG.info(
                     "%s BIND source=%s UUID=%s NetBox ID=%s VM=%s",
@@ -344,7 +398,7 @@ class Engine:
                     row["netbox_vm_id"],
                 )
         LOG.info(
-            "Checked %d VMware VMs; pending SSoT creation=%d; errors=%d",
+            "Checked %d VMware VMs; pending SSoT=%d; errors=%d",
             len(self.vms),
             len(plan.pending),
             errors,

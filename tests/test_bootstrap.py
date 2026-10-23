@@ -43,11 +43,13 @@ def test_duplicate_bios_uuid_blocks_cross_vcenter(env):
         env.engine()
 
 
-def test_changed_identity_cannot_bootstrap_to_bound_id(env):
+def test_recreated_identity_is_deferred_instead_of_bootstrapped_to_old_bound_id(env):
     env.bind()
     env.migrate(instance_uuid="44444444-4444-4444-8444-444444444444")
-    assert env.engine().bootstrap(True) == 2
-    assert len(env.store.rows()) == 1
+    assert env.engine().bootstrap(True) == 0
+    assert not env.store.rows()
+    assert not env.nb.patches
+    assert 3219 in env.nb.records
 
 
 def test_manual_bind_old_cluster_then_move(env):

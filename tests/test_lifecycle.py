@@ -142,7 +142,7 @@ def test_inventory_drift_discards_bindings_and_cleanup(env, monkeypatch):
 
 
 @pytest.mark.parametrize("retained_identity", ["name", "bios"])
-def test_changed_uuid_is_not_treated_as_new_and_old_mapping_is_retained(env, retained_identity):
+def test_absent_previous_identity_is_cleaned_and_replacement_left_for_ssot(env, retained_identity):
     env.bind()
     changes = {
         "instance_uuid": str(UUID(int=1001)),
@@ -153,10 +153,10 @@ def test_changed_uuid_is_not_treated_as_new_and_old_mapping_is_retained(env, ret
         env.vm.name if retained_identity == "name" else env.vm.bios_uuid
     )
     env.migrate(**changes)
-    for _ in range(2):
-        assert env.engine().reconcile(True) == 2
-        assert env.store.rows()[0]["vm_instance_uuid"] == env.vm.instance_uuid
-        assert not env.nb.patches
+    assert env.engine().reconcile(True) == 0
+    assert not env.store.rows()
+    assert not env.nb.patches
+    assert 3219 in env.nb.records
 
 
 @pytest.mark.parametrize("cid", [10, 20])
